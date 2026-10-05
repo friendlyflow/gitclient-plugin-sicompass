@@ -31,8 +31,8 @@ GitHub releases, one build per platform. The plugin platform is described in
   `GIT_DIR` and its kind removed from the environment. It is `git` from `PATH`,
   then from `~/.local/bin`. There is no `gitBinary` setting.
 - **fetch, pull and push** run on a thread (`worker::Network`) so the UI never
-  waits on the network. Every call from the app has a 10-second deadline, so
-  nothing slow may run inside one.
+  waits on the network. The app waits for every call to answer, drawing
+  nothing meanwhile, so nothing slow may run inside one.
 - **The watcher** that notices commits made elsewhere stats `.git` from
   `poll`, at most once a second, instead of from a thread.
 - **Strings** come from the app (`host::translate`), which holds this plugin's
