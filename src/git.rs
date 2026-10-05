@@ -11,12 +11,11 @@
 //! `THIRD-PARTY-LICENSES.html`, and reuses the user's own credential helpers,
 //! ssh agent and config exactly as their shell would.
 //!
-//! Inside the sandbox git is started through the host's `process` interface,
-//! which runs the one program `plugin.json` lists (`git`, resolved on the
-//! user's `PATH`). Natively, in the unit tests, it is `std::process`. Both get
-//! the same arguments and environment from here. The one difference: the host
-//! takes arguments as strings, so in the sandbox a file name that is not valid
-//! UTF-8 reaches git with its invalid bytes replaced.
+//! The plugin is a program running with the user's rights, so git is an
+//! ordinary child process (`std::process`, through
+//! `sicompass_sdk::plugin::command`, which keeps a console window from
+//! flashing up on Windows). It is found on the user's `PATH`, then in
+//! `~/.local/bin` (see [`resolve_program`]).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -184,22 +183,16 @@ const ENV: &[(&str, &str)] = &[
 ];
 
 /// Run `binary` with `args` (the global ones included) to completion.
-#[cfg(not(target_arch = "wasm32"))]
 fn exec(binary: &str, args: &[OsString]) -> Output {
-    let mut cmd = std::process::Command::new(binary);
+    let mut cmd = sicompass_sdk::plugin::command(resolve_program(binary));
     cmd.args(args);
     for var in UNSET {
         cmd.env_remove(var);
     }
     cmd.envs(ENV.iter().copied());
-
-    #[cfg(windows)]
-    {
-        // Without this every git call flashes a console window over the app.
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    // Nothing for git to read: the app's channel is never stdin anyway, but a
+    // git that waits on input would wait forever.
+    cmd.stdin(std::process::Stdio::null());
 
     match cmd.output() {
         Ok(out) => Output {
@@ -215,58 +208,57 @@ fn exec(binary: &str, args: &[OsString]) -> Output {
     }
 }
 
-/// Run `binary` with `args` to completion, through the host.
+/// Where to start `program` from: the name itself when it is on `PATH` (or is
+/// a path already), else `~/.local/bin/<program>` when that exists.
 ///
-/// The host's reads never block, so this reads, waits a moment and reads
-/// again until git has exited. The host reports the exit only once all of the
-/// output has arrived, so what is read after it is the rest.
-#[cfg(target_arch = "wasm32")]
-fn exec(binary: &str, args: &[OsString]) -> Output {
-    use sicompass_pdk::process::Child;
-    const CHUNK: u32 = 1 << 20;
+/// A desktop session's `PATH` often lacks `~/.local/bin`, where per-user
+/// installers put programs, so a git installed there would otherwise be
+/// "not found" in sicompass while working in the user's terminal.
+pub fn resolve_program(program: &str) -> PathBuf {
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE")
+    } else {
+        std::env::var_os("HOME")
+    };
+    resolve_in(
+        program,
+        &std::env::var_os("PATH").unwrap_or_default(),
+        home.map(PathBuf::from),
+    )
+}
 
-    let args: Vec<String> = args
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    let env: Vec<(String, String)> = ENV
-        .iter()
-        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-        .collect();
-    let unset: Vec<String> = UNSET.iter().map(|v| (*v).to_owned()).collect();
-    let child = match Child::spawn(binary, &args, None, &env, &unset, None) {
-        Ok(c) => c,
-        Err(e) => {
-            return Output {
-                code: None,
-                stdout: Vec::new(),
-                stderr: e,
-            };
-        }
-    };
+/// [`resolve_program`], with `PATH` and the home folder handed in.
+fn resolve_in(program: &str, path: &std::ffi::OsStr, home: Option<PathBuf>) -> PathBuf {
+    let as_is = PathBuf::from(program);
+    if program.contains(['/', '\\']) {
+        return as_is;
+    }
+    if std::env::split_paths(path).any(|dir| is_program(&dir, program)) {
+        return as_is;
+    }
+    if let Some(dir) = home.map(|h| h.join(".local").join("bin"))
+        && is_program(&dir, program)
+    {
+        return dir.join(program);
+    }
+    as_is
+}
 
-    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-    let drain = |stdout: &mut Vec<u8>, stderr: &mut Vec<u8>| loop {
-        let out = child.read(CHUNK);
-        let err = child.read_stderr(CHUNK);
-        if out.is_empty() && err.is_empty() {
-            break;
-        }
-        stdout.extend(out);
-        stderr.extend(err);
-    };
-    let code = loop {
-        let exited = child.try_wait();
-        drain(&mut stdout, &mut stderr);
-        if let Some(code) = exited {
-            break code;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    };
-    Output {
-        code: Some(code),
-        stdout,
-        stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
+/// Whether `dir` holds an executable named `program` (on Windows, with any
+/// `PATHEXT` extension too).
+fn is_program(dir: &Path, program: &str) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(dir.join(program))
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+        std::iter::once(String::new())
+            .chain(exts.split(';').filter(|e| !e.is_empty()).map(str::to_owned))
+            .any(|ext| dir.join(format!("{program}{ext}")).is_file())
     }
 }
 
@@ -288,7 +280,7 @@ pub fn literal_pathspec(path: &[u8]) -> OsString {
 /// UTF-8 comes back from git as raw bytes, and lossy conversion replaces them
 /// with U+FFFD. Handing *that* back to `git add` addresses a file that does not
 /// exist, and the stage silently does nothing.
-#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[cfg(unix)]
 pub fn os_string_from_bytes(bytes: &[u8]) -> OsString {
     use std::os::unix::ffi::OsStringExt;
     OsString::from_vec(bytes.to_vec())
@@ -296,8 +288,7 @@ pub fn os_string_from_bytes(bytes: &[u8]) -> OsString {
 
 /// Windows has no byte-oriented path API, and git on Windows emits UTF-8
 /// regardless of the filesystem encoding, so lossy conversion is exact here.
-/// In the sandbox arguments travel to the host as strings anyway.
-#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+#[cfg(not(unix))]
 pub fn os_string_from_bytes(bytes: &[u8]) -> OsString {
     OsString::from(String::from_utf8_lossy(bytes).into_owned())
 }
@@ -404,16 +395,6 @@ impl Git {
         let bytes = self.run(args)?;
         let s = String::from_utf8_lossy(&bytes);
         Ok(s.trim_end_matches(['\n', '\r']).to_owned())
-    }
-
-    /// The directory git is pointed at.
-    pub fn cwd(&self) -> &Path {
-        &self.cwd
-    }
-
-    /// The program run.
-    pub fn binary(&self) -> &str {
-        &self.binary
     }
 
     /// A copy pointed at a different directory, keeping the configured binary.
@@ -570,6 +551,36 @@ mod tests {
 
         assert!(out.ok(), "{}", out.stderr);
         assert_eq!(out.text(), "true");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_missing_from_path_is_found_in_local_bin() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".local").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("only-here");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let path = std::env::join_paths([empty.path()]).unwrap();
+
+        assert_eq!(
+            resolve_in("only-here", &path, Some(home.path().to_owned())),
+            exe
+        );
+        // On PATH, the bare name is kept, so the OS finds it the usual way.
+        let path = std::env::join_paths([&bin]).unwrap();
+        assert_eq!(
+            resolve_in("only-here", &path, Some(home.path().to_owned())),
+            PathBuf::from("only-here")
+        );
+        // Nowhere: the bare name, and starting it reports "not found".
+        assert_eq!(
+            resolve_in("nowhere", &path, Some(home.path().to_owned())),
+            PathBuf::from("nowhere")
+        );
     }
 
     #[test]

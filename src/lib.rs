@@ -42,8 +42,8 @@ mod worker;
 use escape::escape_markup;
 use git::Git;
 use repo::RepoInfo;
-use sicompass_pdk::{
-    Descriptor, FfonElement, ListItem, Plugin, PollResult, ProviderOp, SearchResult, export_plugin,
+use sicompass_sdk::plugin::{
+    Descriptor, FfonElement, ListItem, Plugin, PollResult, ProviderOp, SearchResult,
 };
 use status::Status;
 use std::collections::HashMap;
@@ -56,8 +56,7 @@ pub use git::_set_test_no_network;
 //
 // These are what the user reads: the app's palette renders the raw strings from
 // `commands()` and never calls `command_label()` (src/sicompass/src/list.rs).
-// `command_label` is implemented anyway, for a WASM host and for the day that
-// changes, but nothing here may depend on it.
+// `command_label` is implemented anyway, for the day that changes, but nothing here may depend on it.
 //
 // None of them may equal a reserved id. `"delete"` hijacks Ctrl+D and Delete,
 // and `"toggle bookmark"` hijacks `b`; both are matched by exact equality, so
@@ -325,8 +324,9 @@ pub struct GitClientProvider {
     /// Where the cursor is inside the repository.
     segments: Vec<Segment>,
 
-    /// The `git` started, on the user's `PATH`. Always `git`: the host starts
-    /// only the programs `plugin.json` lists, by name.
+    /// The `git` started: on the user's `PATH`, or in `~/.local/bin` (see
+    /// [`git::resolve_program`]). Always `git`, the one program `plugin.json`
+    /// declares.
     binary: String,
 
     /// The commit message being composed, as typed.
@@ -1984,7 +1984,7 @@ impl GitClientProvider {
         }
         self.timeline.push(ProviderOp {
             command: command.to_owned(),
-            payload: sicompass_pdk::encode_one(&payload),
+            payload: sicompass_sdk::plugin::encode_one(&payload),
             label: label_command.to_owned(),
         });
     }
@@ -1992,7 +1992,7 @@ impl GitClientProvider {
     /// Apply a recorded action backwards (`undo`) or forwards again (`redo`).
     fn reverse(&mut self, entry: &ProviderOp, undo: bool, error: &mut String) {
         let command = &entry.command;
-        let parts: Vec<String> = sicompass_pdk::decode_one(&entry.payload)
+        let parts: Vec<String> = sicompass_sdk::plugin::decode_one(&entry.payload)
             .as_ref()
             .and_then(|p| p.as_obj())
             .map(|o| {
@@ -2199,7 +2199,7 @@ impl Plugin for GitClientProvider {
     }
 
     fn init(&mut self) {
-        if let Some(v) = sicompass_pdk::host::get_setting(SETTING_AUTOFETCH) {
+        if let Some(v) = sicompass_sdk::plugin::host::get_setting(SETTING_AUTOFETCH) {
             self.on_setting_change(SETTING_AUTOFETCH, &v);
         }
     }
@@ -2554,19 +2554,6 @@ impl Plugin for GitClientProvider {
         if error.is_empty() { Ok(()) } else { Err(error) }
     }
 
-    /// A network job, in the worker instance the host started for it.
-    fn run_task(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, String> {
-        match name {
-            worker::TASK => worker::run_task(input),
-            other => Err(format!("gitclient has no task named `{other}`")),
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn on_task_event(&mut self, id: u64, event: sicompass_pdk::TaskEvent) {
-        self.network.on_task_event(id, event);
-    }
-
     fn on_setting_change(&mut self, key: &str, value: &str) {
         if key == SETTING_AUTOFETCH {
             // Anything unparseable is off rather than a guess: a typo in a
@@ -2577,7 +2564,9 @@ impl Plugin for GitClientProvider {
     }
 
     fn cleanup(&mut self) {
-        // The host stops a running network task itself.
+        // A network job still running is left to finish rather than cut off
+        // halfway through a push: its git outlives the plugin by as long as
+        // the remote takes, and nothing waits for it.
         self.watcher = None;
     }
 }
@@ -2757,8 +2746,6 @@ fn is_binary(bytes: &[u8]) -> bool {
 
 /// The setting (declared in `plugin.json`) for fetching on a timer.
 const SETTING_AUTOFETCH: &str = "gitAutofetchMinutes";
-
-export_plugin!(GitClientProvider);
 
 #[cfg(test)]
 mod tests {
@@ -4566,7 +4553,11 @@ mod tutorial_text_tests {
     #[test]
     fn every_language_has_the_same_tutorial_leaves() {
         let en = tutorial_ids(LOCALES[0].1);
-        assert_eq!(en, ["gitclient-tutorial", "gitclient-tutorial-2"], "en-US's tutorial leaves");
+        assert_eq!(
+            en,
+            ["gitclient-tutorial", "gitclient-tutorial-2"],
+            "en-US's tutorial leaves"
+        );
         for (locale, ftl) in &LOCALES[1..] {
             assert_eq!(tutorial_ids(ftl), en, "{locale} has drifted from en-US");
         }

@@ -2,9 +2,9 @@
 //!
 //! * [`Network`] runs `fetch`, `pull` and `push` in the background. They
 //!   contact a remote, so they take as long as the network does, and a frame
-//!   spent waiting is a frame the app does not draw. Inside the sandbox that is
-//!   a host background task (a second instance of this plugin, see
-//!   [`run_task`]); natively, in the unit tests, a thread.
+//!   spent waiting is a frame the app does not draw (and a call from the app
+//!   that takes longer than its deadline ends the plugin). So each runs on a
+//!   thread of its own, and `poll` collects the result.
 //! * [`Watcher`] notices that the repository changed underneath the app,
 //!   without running `git status` on a timer.
 
@@ -61,16 +61,9 @@ pub struct Network {
     running: RefCell<Option<String>>,
     /// Filled when the job ends, drained by `tick`.
     done: RefCell<Option<Outcome>>,
-    /// The host task running the job.
-    #[cfg(target_arch = "wasm32")]
-    task: Cell<Option<u64>>,
-    /// Natively: the thread's result, when it has one.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// The thread's result, when it has one.
     thread: RefCell<Option<std::sync::mpsc::Receiver<Option<String>>>>,
 }
-
-/// The task a network job runs as.
-pub const TASK: &str = "network";
 
 impl Network {
     pub fn new() -> Network {
@@ -115,22 +108,23 @@ impl Network {
         true
     }
 
-    /// The job travels as the same bytes a host task gets, so these tests
-    /// cover that trip too.
-    #[cfg(not(target_arch = "wasm32"))]
     fn spawn(&self, git: Git, steps: Vec<Vec<String>>) -> bool {
         let (tx, rx) = std::sync::mpsc::channel();
-        let input = encode_job(&git, &steps);
-        std::thread::spawn(move || {
-            // A panic drops `tx`, which `collect` reads as a failure, so the
-            // flag cannot stay set.
-            let _ = tx.send(run_task(&input).map_or_else(Some, |out| decode_result(&out)));
-        });
+        let started = std::thread::Builder::new()
+            .name("gitclient-network".into())
+            .spawn(move || {
+                // A panic drops `tx`, which `collect` reads as a failure, so
+                // the flag cannot stay set.
+                let _ = tx.send(run_steps(&git, &steps));
+            });
+        if let Err(e) = started {
+            eprintln!("gitclient: cannot start the network thread: {e}");
+            return false;
+        }
         *self.thread.borrow_mut() = Some(rx);
         true
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn collect(&self) {
         use std::sync::mpsc::TryRecvError;
         let result = match self.thread.borrow().as_ref().map(|rx| rx.try_recv()) {
@@ -141,96 +135,6 @@ impl Network {
         *self.thread.borrow_mut() = None;
         self.finish(result);
     }
-
-    #[cfg(target_arch = "wasm32")]
-    fn spawn(&self, git: Git, steps: Vec<Vec<String>>) -> bool {
-        match sicompass_pdk::tasks::spawn(TASK, &encode_job(&git, &steps)) {
-            Ok(id) => {
-                self.task.set(Some(id));
-                true
-            }
-            Err(e) => {
-                sicompass_pdk::host::log(&format!("gitclient: {e}"));
-                false
-            }
-        }
-    }
-
-    /// The task reports through [`Network::on_task_event`] instead.
-    #[cfg(target_arch = "wasm32")]
-    fn collect(&self) {}
-
-    /// The end of the task started by [`Network::start`].
-    #[cfg(target_arch = "wasm32")]
-    pub fn on_task_event(&self, id: u64, event: sicompass_pdk::TaskEvent) {
-        use sicompass_pdk::TaskEvent;
-        if self.task.get() != Some(id) {
-            return;
-        }
-        if let TaskEvent::Done(result) = event {
-            self.task.set(None);
-            self.finish(match result {
-                Ok(bytes) => decode_result(&bytes),
-                Err(e) => Some(format!("git: {e}")),
-            });
-        }
-    }
-}
-
-/// A job as the task's input: the folder, the binary, then one `Obj` per step.
-pub fn encode_job(git: &Git, steps: &[Vec<String>]) -> Vec<u8> {
-    use sicompass_sdk::ffon::FfonElement;
-    let mut out = vec![
-        FfonElement::new_str(git.cwd().to_string_lossy().into_owned()),
-        FfonElement::new_str(git.binary().to_owned()),
-    ];
-    for step in steps {
-        let mut obj = FfonElement::new_obj("step");
-        if let Some(o) = obj.as_obj_mut() {
-            for arg in step {
-                o.push(FfonElement::new_str(arg.clone()));
-            }
-        }
-        out.push(obj);
-    }
-    sicompass_sdk::ffon::serialize_binary(&out)
-}
-
-/// The inverse of [`encode_job`].
-pub fn decode_job(bytes: &[u8]) -> Option<(Git, Vec<Vec<String>>)> {
-    let elems = sicompass_sdk::ffon::deserialize_binary(bytes);
-    let mut it = elems.iter();
-    let cwd = it.next()?.as_str()?.to_owned();
-    let binary = it.next()?.as_str()?.to_owned();
-    let steps = it
-        .map(|e| {
-            e.as_obj()
-                .map(|o| {
-                    o.children
-                        .iter()
-                        .filter_map(|c| c.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default()
-        })
-        .collect();
-    Some((Git::new(binary, cwd), steps))
-}
-
-/// A job's result as the task's output: empty on success, else the message.
-pub fn encode_result(error: Option<String>) -> Vec<u8> {
-    error.map(String::into_bytes).unwrap_or_default()
-}
-
-/// The inverse of [`encode_result`].
-pub fn decode_result(bytes: &[u8]) -> Option<String> {
-    (!bytes.is_empty()).then(|| String::from_utf8_lossy(bytes).into_owned())
-}
-
-/// The task itself, in the worker instance: run the job, report how it ended.
-pub fn run_task(input: &[u8]) -> Result<Vec<u8>, String> {
-    let (git, steps) = decode_job(input).ok_or("gitclient: a malformed job")?;
-    Ok(encode_result(run_steps(&git, &steps)))
 }
 
 // ---------------------------------------------------------------------------
@@ -420,50 +324,6 @@ mod tests {
         f.write("a.txt", "two");
         f.run(["add", "a.txt"]);
         assert!(wait_for_change(&w), "the index changed");
-    }
-
-    #[test]
-    fn a_job_travels_to_the_task_and_back() {
-        // The worker instance shares nothing with the UI one, so the job has
-        // to survive the trip as bytes: a commit message with a newline in
-        // it, say.
-        let git = Git::new("git", "/some/repo");
-        let steps = vec![
-            vec!["pull".to_owned(), "--ff-only".to_owned()],
-            vec![
-                "commit".to_owned(),
-                "-m".to_owned(),
-                "two\nlines".to_owned(),
-            ],
-        ];
-        let (back, back_steps) = decode_job(&encode_job(&git, &steps)).unwrap();
-        assert_eq!(back.cwd(), Path::new("/some/repo"));
-        assert_eq!(back.binary(), "git");
-        assert_eq!(back_steps, steps);
-
-        assert_eq!(decode_result(&encode_result(None)), None);
-        assert_eq!(
-            decode_result(&encode_result(Some("git push: rejected".into()))),
-            Some("git push: rejected".to_owned())
-        );
-    }
-
-    #[test]
-    fn the_task_runs_the_job() {
-        let f = Fixture::new();
-        let ok = run_task(&encode_job(&f.git(), &[vec!["--version".to_owned()]])).unwrap();
-        assert_eq!(decode_result(&ok), None);
-        let bad = run_task(&encode_job(
-            &f.git(),
-            &[vec![
-                "rev-parse".to_owned(),
-                "--verify".to_owned(),
-                "nope".to_owned(),
-            ]],
-        ))
-        .unwrap();
-        assert!(decode_result(&bad).unwrap().starts_with("git rev-parse:"));
-        assert!(run_task(b"not a job").is_err());
     }
 
     fn wait_for(n: &Network) -> Outcome {

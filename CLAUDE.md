@@ -8,45 +8,46 @@ whose `/commit-and-push`, `/release`, `/sync` and `/update-cargo` take this
 repo's name as their first argument and then follow the skills in this repo's
 `.claude/skills/`.
 
-It is a sicompass **WASM plugin**: a `cdylib` built for `wasm32-wasip2` with
-`sicompass-pdk`, installed by the sicompass Store from this repo's GitHub
-releases. The plugin platform is described in
-`../sicompass/docs/plugin-platform.md` and `../sicompass/docs/wasm-plugins.md`.
+It is a sicompass **plugin process**: a program (`src/main.rs`) built with the
+SDK's `plugin` feature, which sicompass starts and talks to over its stdin and
+stdout. It runs with the user's rights. The Store installs it from this repo's
+GitHub releases, one build per platform. The plugin platform is described in
+`../sicompass/docs/plugin-platform.md`.
 
 - `plugin.json` is the manifest. Its `name` is `gitclient` and its
   `displayName` `git client` is the settings section (`gitAutofetchMinutes`,
   the same key the built-in had, so a saved value carries over). It asks for
   `"filesystem": ["/"]` (the folder listing picks the repository) and
-  `"process": ["git"]`, which the user approves at install.
+  `"process": ["git"]`. They are what the plugin declares it does, shown to
+  the user before install.
 - `locales/<lang>.ftl`, every id prefixed `gitclient-`, in all four
   languages. A test checks every id is used (in the code or the manifest) and
   every one the code asks for exists.
 
-## The sandbox, and what it changes
+## How it runs
 
-- **git** runs through the host's `process` interface (`src/git.rs`): the
-  same arguments and environment as natively, with `GIT_DIR` and its kind
-  removed through `unset`. The host reports an exit only once the output has
-  all arrived, so reading until then gets all of it. Arguments cross as strings,
-  so a file name that is not valid UTF-8 reaches git with its bad bytes
-  replaced. There is no `gitBinary` setting: the host starts only `git`, by
-  name, from `PATH` or `~/.local/bin`.
-- **fetch, pull and push** run as a host task (`worker::TASK`, a second
-  instance of the plugin) so the UI never waits on the network. Natively the
-  same job runs on a thread, through the same encode and decode, so the tests
-  cover the trip.
+- **git** is an ordinary child process (`src/git.rs`), started with
+  `sicompass_sdk::plugin::command` (no console window on Windows), with
+  `GIT_DIR` and its kind removed from the environment. It is `git` from `PATH`,
+  then from `~/.local/bin`. There is no `gitBinary` setting.
+- **fetch, pull and push** run on a thread (`worker::Network`) so the UI never
+  waits on the network. Every call from the app has a 10-second deadline, so
+  nothing slow may run inside one.
 - **The watcher** that notices commits made elsewhere stats `.git` from
   `poll`, at most once a second, instead of from a thread.
-- **Symlinks** in the folder listing are resolved through `desktop.read-link`
-  (`src/fsx.rs`), since WASI never follows an absolute one.
-- Opening a repository moves the plugin without a navigation call. The pdk's
-  `export_plugin!` tells the host (`host.moved-to`), so nothing here has to.
+- **Strings** come from the app (`host::translate`), which holds this plugin's
+  `locales/`. The unit tests run outside sicompass and read the English bundle
+  instead (`src/localize.rs`).
+- Opening a repository moves the plugin without a navigation call. The SDK's
+  runtime tells the app after every call that moved it, so nothing here has to.
+- stdout is the channel to the app. `println!` lands in stderr, the app's log.
 
 ## Environment (Nix)
 
 The toolchain comes from the flake dev shell in [flake.nix](flake.nix): Rust
-from rust-overlay with the `wasm32-wasip2` target (nixpkgs' rustc has no `std`
-for it), `wasm-tools` and `jq`. Nothing is installed system-wide.
+from rust-overlay with this computer's plugin target (static musl on Linux,
+which nixpkgs' rustc has no `std` for), `jq` and `git`. Nothing is installed
+system-wide.
 
 - **Check once per session**, then stick with the answer: `command -v cargo`.
   - Non-empty: the shell is inside `nix develop`, so run `cargo ...` directly.
@@ -74,8 +75,8 @@ instead, or split into separate sentences.
 ## Testing
 
 - After implementing changes, always run the tests before finishing:
-  `cargo test` (natively), and `./scripts/release-plugin.sh --dry-run`, which
-  also builds the component and audits its imports.
+  `cargo test`, and `./scripts/release-plugin.sh --dry-run`, which also builds
+  this computer's release and verifies it the way the Store will.
 - When adding new code, write or update tests.
 - If tests fail, fix the code. Never leave a task with failing tests.
 
@@ -98,6 +99,10 @@ against the `PLUGIN_PUBLIC_KEY` variable, the key the sicompass store list
 names. The secret key file is `~/.config/sicompass/plugin-keys/gitclient.key`
 on the maintainer's machine. Never print, copy or commit it.
 
-The SDK and the pdk come from crates.io (the source is
-`../sicompass-plugin-sdk`). The commented-out `[patch]` in `Cargo.toml` is for
-working on them together, and stays commented on main.
+The SDK comes from crates.io (the source is `../sicompass-plugin-sdk`). The
+commented-out `[patch]` in `Cargo.toml` is for working on them together, and
+stays commented on main.
+
+A release has one archive per platform. The release workflow builds them on
+five runners (Linux x86_64 and arm64 as static musl, macOS arm64 and x86_64,
+Windows x86_64), then packs, signs and verifies them in one job.
