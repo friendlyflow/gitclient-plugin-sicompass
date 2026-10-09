@@ -3,7 +3,7 @@
 
 [package]
 name = "gitclient-plugin"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Git client for sicompass: a repository as a list of lists, over the git binary, as a plugin"

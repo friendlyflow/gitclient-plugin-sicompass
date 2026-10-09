@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1
+
+- Maintenance release. Nothing changes in the plugin itself.
+
 ## 0.3.0
 
 Git Client is a program of its own now, instead of a sandboxed WebAssembly component.
