@@ -22,6 +22,10 @@
 //! So every git-derived string is routed through [`escape_markup`] on its way
 //! into the tree. The escape is `\<` / `\>`, which the SDK's tag scanner skips
 //! and its renderer unescapes again for display.
+//!
+//! `plugin.json` asks for markup as well, so the app also reads `<b>`, `<div>` and
+//! `<style>` rows. A `<div class="x">` in a diff is no more a tag than a `<button>`
+//! is, and the same escape covers it.
 
 /// Escape `<` and `>` so the SDK's tag parser cannot see a tag.
 ///
@@ -40,6 +44,27 @@ pub fn escape_markup(s: &str) -> String {
             '>' => out.push_str("\\>"),
             other => out.push(other),
         }
+    }
+    out
+}
+
+/// Undo [`escape_markup`]. Text with no `\<` or `\>` passes through untouched, so a
+/// lone backslash survives. Only for a value known to come out of a row: typed text
+/// is already plain.
+pub fn unescape_markup(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(bracket) = chars.next_if(|next| matches!(next, '<' | '>'))
+        {
+            out.push(bracket);
+            continue;
+        }
+        out.push(c);
     }
     out
 }
@@ -66,6 +91,20 @@ mod tests {
             "{raw:?} still parses as a checkbox"
         );
         assert_eq!(tags::strip_display(&escaped), raw, "display text changed");
+    }
+
+    #[test]
+    fn unescape_undoes_escape() {
+        for raw in [
+            "<b>x</b>",
+            "a < b > c",
+            r"\<already\>",
+            r"ends in a backslash\",
+            r"C:\path",
+            "",
+        ] {
+            assert_eq!(unescape_markup(&escape_markup(raw)), raw);
+        }
     }
 
     #[test]

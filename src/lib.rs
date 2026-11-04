@@ -20,7 +20,8 @@
 //!
 //! 1. **Every git-derived string goes through [`escape::escape_markup`].** The
 //!    app reads `<input>`, `<button>` and friends out of any string, so an
-//!    unescaped diff of an HTML file grows live form controls. See `escape.rs`.
+//!    unescaped diff of an HTML file grows live form controls. `plugin.json` asks
+//!    for markup too, so it would also grow `<div>`s. See `escape.rs`.
 //!
 //! 2. **An `Obj` key is an identifier, not a status line.** The key is the path
 //!    segment *and* the key the cursor is restored by after a refresh
@@ -39,7 +40,7 @@ mod repo;
 mod status;
 mod worker;
 
-use escape::escape_markup;
+use escape::{escape_markup, unescape_markup};
 use git::Git;
 use repo::RepoInfo;
 use sicompass_sdk::plugin::{
@@ -490,11 +491,16 @@ impl GitClientProvider {
 
     /// Record the label a child was rendered with, so `push_path` can resolve
     /// it back to a [`Segment`].
+    ///
+    /// Keyed by what the row displays, because that is what comes back: `push_path`
+    /// and `resolve_target` both get the label through `strip_display`, with its
+    /// escapes undone. Keyed by `label` itself, a file with a `<` in its name could
+    /// not be entered or staged.
     fn remember(&mut self, level: &[Segment], label: &str, segment: Segment) {
         self.labels
             .entry(level.to_vec())
             .or_default()
-            .insert(label.to_owned(), segment);
+            .insert(sicompass_sdk::tags::strip_display(label), segment);
     }
 
     /// Start a fresh label map for the level about to be rendered.
@@ -2516,7 +2522,10 @@ impl Plugin for GitClientProvider {
     /// in `changes`, and the one-off row a text command inserts. The pending
     /// command decides which, and it is cleared either way so a later edit of
     /// the message cannot be read as an answer to an old question.
-    fn commit_edit(&mut self, _old: &str, new: &str) -> bool {
+    ///
+    /// `new` is typed text, plain, except that Enter on the message row at rest hands
+    /// back the row's own raw value as both `old` and `new`, with its escapes.
+    fn commit_edit(&mut self, old: &str, new: &str) -> bool {
         match self.pending.take() {
             Some(Pending::Text(op)) => {
                 self.perform_text(op, new.trim());
@@ -2532,7 +2541,11 @@ impl Plugin for GitClientProvider {
                     // message would set it from somewhere the user cannot see.
                     return false;
                 }
-                self.message = new.to_owned();
+                self.message = if old == new {
+                    unescape_markup(new)
+                } else {
+                    new.to_owned()
+                };
                 true
             }
         }
@@ -4561,5 +4574,394 @@ mod tutorial_text_tests {
         for (locale, ftl) in &LOCALES[1..] {
             assert_eq!(tutorial_ids(ftl), en, "{locale} has drifted from en-US");
         }
+    }
+}
+
+/// `plugin.json` asks for markup, so everything here that git or the user wrote is
+/// escaped on its way into a row. The text below is what that is for.
+#[cfg(test)]
+mod markup_tests {
+    use super::*;
+    use crate::repo::fixture::Fixture;
+    use sicompass_sdk::{markup, tags};
+
+    const BOLD: &str = "<b>x</b>";
+    const STYLE: &str = "<style>li { color: red }</style>";
+    const INPUT: &str = "<input>y</input>";
+    const BACKSLASH: &str = r"ends in a backslash\";
+    const HOSTILE: [&str; 4] = [BOLD, STYLE, INPUT, BACKSLASH];
+    /// What a file can really be called: none of them has a `/`.
+    const FILE_NAMES: [&str; 5] = [
+        "<b>x",
+        "<style>li { color: red }",
+        "<input>y",
+        r"ends in a backslash\",
+        r"\<b>",
+    ];
+
+    /// What the row reads, with nothing in it the app would act on.
+    fn assert_literal(row: &str, original: &str) {
+        assert!(!markup::has_markup(row), "markup in {row:?}");
+        assert_eq!(markup::style_sheet(row), None, "a stylesheet: {row:?}");
+        assert!(!tags::has_input(row), "an input in {row:?}");
+        assert!(!tags::has_button(row), "a button in {row:?}");
+        assert_eq!(tags::strip_display(row), original);
+    }
+
+    fn key_of(e: &FfonElement) -> &str {
+        e.as_str().unwrap_or_else(|| &e.as_obj().unwrap().key)
+    }
+
+    fn opened(f: &Fixture) -> GitClientProvider {
+        let mut p = GitClientProvider::new();
+        p.browse_path = f.path();
+        p.fetch();
+        let mut error = String::new();
+        GitClientProvider::handle_command(&mut p, CMD_OPEN, "", 0, &mut error);
+        assert!(error.is_empty(), "{error}");
+        p.fetch();
+        p
+    }
+
+    /// Press Right on the row whose display text ends with `tail`, the way the app
+    /// does: the segment goes through `strip_display`.
+    fn enter_row(p: &mut GitClientProvider, tail: &str) -> Vec<FfonElement> {
+        let rows = p.fetch();
+        let row = rows
+            .iter()
+            .find(|e| tags::strip_display(key_of(e)).ends_with(tail))
+            .unwrap_or_else(|| panic!("no row ending in {tail:?}: {rows:?}"));
+        p.push_path(&tags::strip_display(key_of(row)));
+        p.fetch()
+    }
+
+    fn enter_changes(p: &mut GitClientProvider) -> Vec<FfonElement> {
+        enter_row(p, &localize::t("gitclient-section-changes"))
+    }
+
+    /// Unescaped, the app would act on these, which is what the tests below rule out.
+    #[test]
+    fn this_text_is_live_when_nothing_escapes_it() {
+        assert!(markup::has_markup(BOLD));
+        assert!(markup::style_sheet(STYLE).is_some());
+        assert!(tags::has_input(INPUT));
+    }
+
+    #[test]
+    fn the_manifest_asks_for_markup() {
+        assert!(include_str!("../plugin.json").contains(r#""markup": true"#));
+    }
+
+    #[test]
+    fn a_diff_is_shown_literally() {
+        let f = Fixture::new();
+        f.write("page.html", "before\n");
+        f.commit("first");
+        f.write("page.html", &format!("{}\n", HOSTILE.join("\n")));
+
+        let mut p = opened(&f);
+        enter_changes(&mut p);
+        let diff = enter_row(&mut p, "page.html");
+        for text in HOSTILE {
+            let wanted = format!("+{text}");
+            let row = diff
+                .iter()
+                .find(|e| tags::strip_display(key_of(e)) == wanted)
+                .unwrap_or_else(|| panic!("no row for {wanted:?}: {diff:?}"));
+            assert_literal(key_of(row), &wanted);
+        }
+        for row in &diff {
+            assert!(!markup::has_markup(key_of(row)), "{row:?}");
+        }
+    }
+
+    #[test]
+    fn an_untracked_file_is_shown_literally() {
+        let f = Fixture::new();
+        f.write("new.html", &format!("{}\n", HOSTILE.join("\n")));
+        let mut p = opened(&f);
+        enter_changes(&mut p);
+        let content = enter_row(&mut p, "new.html");
+        for (row, text) in content.iter().zip(HOSTILE) {
+            assert_literal(key_of(row), &format!("+{text}"));
+        }
+    }
+
+    /// A file's own name in the changes list, entered and acted on by that name.
+    /// Used to fail: the labels were remembered with their escapes and looked up
+    /// without them, so Right and stage both found nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_is_listed_literally_and_reached_by_its_real_name() {
+        for name in FILE_NAMES {
+            let f = Fixture::new();
+            f.write(name, "<b>inside</b>\n");
+            let mut p = opened(&f);
+
+            let rows = enter_changes(&mut p);
+            let row = rows
+                .iter()
+                .find(|e| tags::strip_display(key_of(e)).ends_with(name))
+                .unwrap_or_else(|| panic!("{name:?} is not listed: {rows:?}"));
+            let raw = key_of(row).to_owned();
+            assert!(!markup::has_markup(&raw), "{raw:?}");
+            assert!(!tags::has_input(&raw), "{raw:?}");
+
+            // The handler stages what the raw key resolves to.
+            let mut error = String::new();
+            GitClientProvider::handle_command(&mut p, CMD_STAGE, &raw, 0, &mut error);
+            assert!(error.is_empty(), "{error}");
+            let staged = f.run(["diff", "--cached", "--name-only", "-z"]);
+            assert_eq!(staged, format!("{name}\0"));
+
+            let diff = enter_row(&mut p, name);
+            assert!(
+                diff.iter()
+                    .any(|e| tags::strip_display(key_of(e)) == "+<b>inside</b>"),
+                "{name:?}: {diff:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_commit_subject_and_body_are_shown_literally() {
+        for text in HOSTILE {
+            let f = Fixture::new();
+            f.write("a.txt", "one\n");
+            f.run(["add", "-A"]);
+            f.run(["commit", "-q", "-m", text, "-m", &format!("body {text}")]);
+
+            let mut p = opened(&f);
+            let graph = enter_row(&mut p, &localize::t("gitclient-section-graph"));
+            let row = key_of(&graph[0]).to_owned();
+            assert!(!markup::has_markup(&row), "{row:?}");
+            assert!(!tags::has_input(&row), "{row:?}");
+            assert!(tags::strip_display(&row).ends_with(text), "{row:?}");
+
+            let commit = enter_row(&mut p, text);
+            assert_literal(key_of(&commit[0]), text);
+            let shown: Vec<String> = commit
+                .iter()
+                .map(|e| tags::strip_display(key_of(e)))
+                .collect();
+            assert!(shown.contains(&format!("body {text}")), "{shown:?}");
+            for row in &commit {
+                assert!(!markup::has_markup(key_of(row)), "{row:?}");
+                assert!(!tags::has_input(key_of(row)), "{row:?}");
+            }
+        }
+    }
+
+    /// `<b>x` is a legal branch name.
+    #[test]
+    fn a_branch_is_shown_literally_and_reached_by_its_real_name() {
+        let name = "<b>x";
+        let f = Fixture::new();
+        f.write("a.txt", "one\n");
+        f.commit(BOLD);
+        f.run(["branch", name]);
+
+        let mut p = opened(&f);
+        enter_row(&mut p, &localize::t("gitclient-section-branches"));
+        let rows = enter_row(&mut p, &localize::t("gitclient-scope-local"));
+        let row = rows
+            .iter()
+            .find(|e| tags::strip_display(key_of(e)) == name)
+            .unwrap_or_else(|| panic!("{rows:?}"));
+        let raw = key_of(row).to_owned();
+        assert_literal(&raw, name);
+
+        let mut error = String::new();
+        GitClientProvider::handle_command(&mut p, CMD_CHECKOUT_BRANCH, &raw, 0, &mut error);
+        assert!(error.is_empty(), "{error}");
+        assert_eq!(f.run(["rev-parse", "--abbrev-ref", "HEAD"]).trim(), name);
+
+        let details = enter_row(&mut p, name);
+        for row in &details {
+            assert!(!markup::has_markup(key_of(row)), "{row:?}");
+        }
+        assert!(
+            details
+                .iter()
+                .any(|e| tags::strip_display(key_of(e)).ends_with(BOLD)),
+            "the subject reads as written: {details:?}"
+        );
+    }
+
+    #[test]
+    fn a_stash_is_shown_literally() {
+        for text in HOSTILE {
+            let f = Fixture::new();
+            f.write("a.txt", "one\n");
+            f.commit("first");
+            f.write("a.txt", "two\n");
+            f.run(["stash", "push", "-q", "-m", text]);
+
+            let mut p = opened(&f);
+            let rows = enter_row(&mut p, &localize::t("gitclient-section-stashes"));
+            let row = key_of(&rows[0]).to_owned();
+            assert!(!markup::has_markup(&row), "{row:?}");
+            assert!(!tags::has_input(&row), "{row:?}");
+            assert!(tags::strip_display(&row).ends_with(text), "{row:?}");
+            let stash = enter_row(&mut p, text);
+            assert_literal(key_of(&stash[0]), &format!("On main: {text}"));
+        }
+    }
+
+    #[test]
+    fn a_remote_is_shown_literally() {
+        let f = Fixture::new();
+        f.write("a.txt", "one\n");
+        f.commit("first");
+        f.run(["remote", "add", "origin", "https://example.invalid/<b>x"]);
+        let mut p = opened(&f);
+        enter_row(&mut p, &localize::t("gitclient-section-remotes"));
+        let rows = enter_row(&mut p, "origin");
+        assert!(!rows.is_empty());
+        for row in &rows {
+            assert!(!markup::has_markup(key_of(row)), "{row:?}");
+            assert!(
+                tags::strip_display(key_of(row)).contains("https://example.invalid/<b>x"),
+                "{row:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_is_listed_literally_and_entered_by_its_real_name() {
+        for name in [
+            "<b>x",
+            "<style>li { color: red }",
+            "<input>y",
+            r"\<b>",
+            r"mid\dle",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let real = dir.path().join(name);
+            std::fs::create_dir(&real).unwrap();
+            let mut p = GitClientProvider::new();
+            p.browse_path = dir.path().to_path_buf();
+            let rows = p.fetch();
+            let key = key_of(&rows[0]).to_owned();
+            assert_literal(&key, name);
+            p.push_path(&tags::strip_display(&key));
+            assert_eq!(p.browse_path, real);
+        }
+    }
+
+    /// Listed right, entered wrong, with or without markup: `push_path` trims a
+    /// trailing backslash on every platform, so on Unix a folder really named `back\`
+    /// is walked into as `back`. Trimming only on Windows would fix it.
+    #[cfg(unix)]
+    #[test]
+    fn known_limit_a_folder_ending_in_a_backslash_loses_it_on_the_way_in() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(BACKSLASH)).unwrap();
+        let mut p = GitClientProvider::new();
+        p.browse_path = dir.path().to_path_buf();
+        let rows = p.fetch();
+        let segment = tags::strip_display(key_of(&rows[0]));
+        assert_eq!(segment, BACKSLASH);
+        p.push_path(&segment);
+        assert_eq!(
+            p.browse_path,
+            dir.path().join(BACKSLASH.trim_end_matches('\\'))
+        );
+    }
+
+    fn message_row(p: &mut GitClientProvider) -> String {
+        p.fetch()
+            .iter()
+            .map(key_of)
+            .find(|k| k.contains("<input>"))
+            .expect("the message row")
+            .to_owned()
+    }
+
+    /// The whole way round: typed, shown, Enter on it at rest, committed.
+    #[test]
+    fn a_commit_message_keeps_its_original_bytes() {
+        for text in [BOLD, STYLE, INPUT, r"echo \<b\>"] {
+            let f = Fixture::new();
+            f.write("a.txt", "one\n");
+            let mut p = opened(&f);
+            enter_changes(&mut p);
+
+            assert!(p.commit_edit("", text));
+            assert_eq!(p.message, text);
+            let row = message_row(&mut p);
+            assert!(!markup::has_markup(&row), "{row:?}");
+            assert!(tags::has_input(&row), "{row:?}");
+            let raw = tags::extract_input(&row).unwrap();
+            assert_eq!(unescape_markup(&raw), text);
+
+            // Enter on the row at rest, more than once: nothing may build up.
+            for _ in 0..3 {
+                let raw = tags::extract_input(&message_row(&mut p)).unwrap();
+                assert!(p.commit_edit(&raw, &raw));
+                assert_eq!(p.message, text);
+            }
+
+            p.on_button_press("commit");
+            assert_eq!(f.run(["log", "-1", "--format=%s"]).trim_end(), text);
+        }
+    }
+
+    /// `old` is raw and `new` is typed: the typed text is not unescaped, even when it
+    /// holds what an escape looks like.
+    #[test]
+    fn a_typed_message_is_never_unescaped() {
+        let f = Fixture::new();
+        f.write("a.txt", "one\n");
+        let mut p = opened(&f);
+        enter_changes(&mut p);
+        assert!(p.commit_edit("", "<b>"));
+        assert!(p.commit_edit(r"\<b\>", r"a \<b\> c"));
+        assert_eq!(p.message, r"a \<b\> c");
+    }
+
+    /// The one case the row cannot tell apart: retyping over `<b>` exactly the
+    /// characters the row holds for it, `\<b\>`, reads as Enter on the row at rest.
+    #[test]
+    fn known_limit_retyping_a_message_as_its_own_escape_changes_nothing() {
+        let f = Fixture::new();
+        f.write("a.txt", "one\n");
+        let mut p = opened(&f);
+        enter_changes(&mut p);
+        assert!(p.commit_edit("", "<b>"));
+        assert!(p.commit_edit(r"\<b\>", r"\<b\>"));
+        assert_eq!(p.message, "<b>");
+    }
+
+    #[test]
+    fn a_message_ending_in_a_backslash_is_an_input() {
+        let f = Fixture::new();
+        f.write("a.txt", "one\n");
+        let mut p = opened(&f);
+        enter_changes(&mut p);
+        assert!(p.commit_edit("", BACKSLASH));
+        let row = message_row(&mut p);
+        assert!(!markup::has_markup(&row), "{row:?}");
+        assert!(tags::has_input(&row), "{row:?}");
+        assert_eq!(tags::extract_input(&row).as_deref(), Some(BACKSLASH));
+
+        p.on_button_press("commit");
+        assert_eq!(f.run(["log", "-1", "--format=%s"]).trim_end(), BACKSLASH);
+    }
+
+    /// A branch name typed into a command's row goes to git as typed.
+    #[test]
+    fn a_typed_branch_name_reaches_git_as_typed() {
+        let f = Fixture::new();
+        f.write("a.txt", "one\n");
+        f.commit("first");
+        let mut p = opened(&f);
+        p.segments = vec![Segment::Section(Section::Branches)];
+        let mut error = String::new();
+        GitClientProvider::handle_command(&mut p, CMD_CREATE_BRANCH, "", 0, &mut error);
+        assert!(error.is_empty(), "{error}");
+        assert!(p.commit_edit("", "<b>x"));
+        assert_eq!(f.run(["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "<b>x");
     }
 }
