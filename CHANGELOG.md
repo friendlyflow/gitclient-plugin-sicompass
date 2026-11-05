@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+- A file or branch with a bracket in its name can be entered, staged and checked out, and Enter on the commit message no longer adds backslashes to it.
+- Needs sicompass 0.2.4.
+- Intel macs are not built any more.
+
 ## 0.3.1
 
 - Maintenance release. Nothing changes in the plugin itself.
